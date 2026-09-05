@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import os
 import uuid
+import asyncio
+import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 try:
     from pymongo import MongoClient
@@ -20,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "riskora")
+CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://localhost:3000").split(",") if origin.strip()]
+logger = logging.getLogger("riskora")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 mongo_db = None
 if MongoClient:
@@ -31,12 +38,36 @@ if MongoClient:
         mongo_db = None
 
 app = FastAPI(title="Riskora API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def request_guard(request: Request, call_next):
+    client_id = request.client.host if request.client else "unknown"
+    if request.url.path.startswith("/api/"):
+        current = time.monotonic()
+        recent = [stamp for stamp in request_windows.get(client_id, []) if current - stamp < 60]
+        if len(recent) >= 120:
+            logger.warning("rate limit exceeded client=%s path=%s", client_id, request.url.path)
+            return JSONResponse(status_code=429, content={"detail": "rate limit exceeded; retry shortly"})
+        recent.append(current)
+        request_windows[client_id] = recent
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled request failure method=%s path=%s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "internal server error"})
+    logger.info("request method=%s path=%s status=%s duration_ms=%.1f", request.method, request.url.path, response.status_code, (time.perf_counter() - started) * 1000)
+    return response
 
 memory: dict[str, list[dict[str, Any]]] = {"live": [], "demo": []}
 relationships: list[dict[str, Any]] = []
 money_trails: dict[str, dict[str, Any]] = {}
 investigations: dict[str, dict[str, Any]] = {}
+state_lock = asyncio.Lock()
+request_windows: dict[str, list[float]] = {}
+SCENARIO_NAMES = {"legitimate_growth", "abuse_ring", "fraud_escalation", "cash_out", "fraud_escalation", "normal_activity", "suspicious_transaction", "account_takeover", "cross_border_anomaly", "slow_fraud", "distributed_fraud", "suspicious_merchant", "false_positive", "false_negative", "fraud_adaptation", "insufficient_evidence", "vpn_legitimate", "frequent_ip_changes"}
 
 
 def now() -> str:
@@ -85,7 +116,7 @@ def risk_for(payload: dict[str, Any], scenario: str | None = None) -> dict[str, 
 
 def normalize(payload: dict[str, Any], mode: str, scenario: str | None = None) -> dict[str, Any]:
     item = {
-        "transaction_id": payload.get("transaction_id", f"txn_{uuid.uuid4().hex[:10]}"),
+        "transaction_id": payload.get("transaction_id") or f"txn_{uuid.uuid4().hex[:10]}",
         "timestamp": now(),
         "amount": float(payload.get("amount", 0)),
         "currency": payload.get("currency", "INR"),
@@ -144,24 +175,59 @@ def overview(mode: str) -> dict[str, Any]:
 
 
 class TransactionCreate(BaseModel):
+    transaction_id: str | None = Field(default=None, min_length=3, max_length=80)
     amount: float = Field(gt=0)
-    currency: str = "INR"
-    payment_method: str = "upi"
-    country: str = "IN"
-    merchant_country: str = "IN"
-    customer_id: str = "cus_live_001"
-    device_id: str = "dev_known_001"
-    failed_attempt_count: int = 0
-    velocity_10m: int = 1
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+    payment_method: str = Field(default="upi", min_length=2, max_length=30)
+    country: str = Field(default="IN", min_length=2, max_length=3)
+    merchant_country: str = Field(default="IN", min_length=2, max_length=3)
+    customer_id: str = Field(default="cus_live_001", min_length=3, max_length=80)
+    device_id: str = Field(default="dev_known_001", min_length=3, max_length=80)
+    failed_attempt_count: int = Field(default=0, ge=0, le=100)
+    velocity_10m: int = Field(default=1, ge=0, le=1000)
     vpn_flag: bool = False
-    ip_address: str = "192.0.2.44"
-    payment_instrument_id: str = "pi_live_001"
-    beneficiary_id: str = "ben_live_001"
-    destination_account_id: str = "acct_live_001"
+    ip_address: str = Field(default="192.0.2.44", min_length=3, max_length=80)
+    payment_instrument_id: str = Field(default="pi_live_001", min_length=3, max_length=80)
+    beneficiary_id: str = Field(default="ben_live_001", min_length=3, max_length=80)
+    destination_account_id: str = Field(default="acct_live_001", min_length=3, max_length=80)
+
+    @field_validator("currency", "country", "merchant_country", mode="before")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("merchant_country")
+    @classmethod
+    def validate_merchant_country(cls, value: str) -> str:
+        if len(value) not in {2, 3}:
+            raise ValueError("merchant_country must be an ISO-like 2 or 3 character code")
+        return value
 
 
 class ScenarioRequest(BaseModel):
-    scenario: str
+    scenario: str = Field(min_length=3, max_length=50)
+
+    @field_validator("scenario")
+    @classmethod
+    def validate_scenario(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in SCENARIO_NAMES:
+            raise ValueError(f"unsupported scenario; choose one of: {', '.join(sorted(SCENARIO_NAMES))}")
+        return normalized
+
+
+class OutcomeRequest(BaseModel):
+    outcome: str = Field(min_length=3, max_length=30)
+    confidence: int = Field(default=90, ge=0, le=100)
+    analyst_note: str = Field(default="Verified by analyst", min_length=3, max_length=500)
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in {"CONFIRMED FRAUD", "LEGITIMATE", "UNCERTAIN"}:
+            raise ValueError("outcome must be CONFIRMED FRAUD, LEGITIMATE, or UNCERTAIN")
+        return normalized
 
 
 @app.get("/api/")
@@ -181,12 +247,17 @@ async def get_transactions(mode: str = "live") -> list[dict[str, Any]]:
 
 @app.post("/api/transactions", status_code=201)
 async def create_transaction(payload: TransactionCreate) -> dict[str, Any]:
-    item = normalize(payload.model_dump(), "live")
-    memory["live"].append(item)
-    if mongo_db is not None:
-        mongo_db.transactions.replace_one({"transaction_id": item["transaction_id"], "mode": "live"}, item, upsert=True)
-    create_relationships(item)
-    return item
+    async with state_lock:
+        raw = payload.model_dump()
+        item = normalize(raw, "live")
+        if any(row["transaction_id"] == item["transaction_id"] for row in memory["live"]):
+            raise HTTPException(status_code=409, detail="transaction_id already processed in LIVE mode")
+        memory["live"].append(item)
+        if mongo_db is not None:
+            mongo_db.transactions.replace_one({"transaction_id": item["transaction_id"], "mode": "live"}, item, upsert=True)
+        create_relationships(item)
+        logger.info("live transaction ingested transaction_id=%s risk=%s", item["transaction_id"], item["risk"]["risk_score"])
+        return item
 
 
 def create_relationships(item: dict[str, Any]) -> None:
@@ -218,8 +289,7 @@ def create_money_trail(item: dict[str, Any], cash_out: bool = False) -> None:
     money_trails[source] = {"transaction_id": source, "nodes": nodes, "edges": edges, "cash_out_detected": cash_out, "notice": "CASH-OUT DETECTED — DIGITAL TRACE ENDS HERE" if cash_out else None, "estimated_exposure": item["risk"]["estimated_exposure"]}
 
 
-@app.post("/api/simulation/scenario")
-async def run_scenario(request: ScenarioRequest) -> dict[str, Any]:
+async def _run_scenario(request: ScenarioRequest) -> dict[str, Any]:
     memory["demo"] = []
     relationships[:] = [row for row in relationships if row["mode"] != "demo"]
     for investigation_id in list(investigations):
@@ -241,6 +311,15 @@ async def run_scenario(request: ScenarioRequest) -> dict[str, Any]:
             create_money_trail(item)
     result = overview("demo")
     return {"scenario": request.scenario, "transactions_created": count, "alerts_created": len(result["alerts"]), "overview": result}
+
+
+@app.post("/api/simulation/scenario")
+async def run_scenario(request: ScenarioRequest) -> dict[str, Any]:
+    async with state_lock:
+        logger.info("demo scenario started scenario=%s", request.scenario)
+        result = await _run_scenario(request)
+        logger.info("demo scenario completed scenario=%s transactions=%s alerts=%s", request.scenario, result["transactions_created"], result["alerts_created"])
+        return result
 
 
 @app.get("/api/entities/{entity_id}/network")
@@ -275,12 +354,14 @@ async def get_investigations(mode: str = "demo") -> list[dict[str, Any]]:
 
 
 @app.post("/api/investigations/{investigation_id}/outcome")
-async def record_outcome(investigation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    investigation = investigations.get(investigation_id)
-    if not investigation:
-        raise HTTPException(status_code=404, detail="investigation not found")
-    investigation.update({"status": payload.get("outcome", "UNCERTAIN"), "analyst_note": payload.get("analyst_note", "Verified by analyst"), "outcome_confidence": payload.get("confidence", 90), "updated_at": now()})
-    return investigation
+async def record_outcome(investigation_id: str, payload: OutcomeRequest) -> dict[str, Any]:
+    async with state_lock:
+        investigation = investigations.get(investigation_id)
+        if not investigation:
+            raise HTTPException(status_code=404, detail="investigation not found")
+        investigation.update({"status": payload.outcome, "analyst_note": payload.analyst_note, "outcome_confidence": payload.confidence, "updated_at": now()})
+        logger.info("investigation outcome recorded investigation_id=%s outcome=%s", investigation_id, payload.outcome)
+        return investigation
 
 
 @app.get("/api/model/metrics")

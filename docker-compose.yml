@@ -1,0 +1,26 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - riskora_mongo:/data/db
+
+  riskora:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: riskora
+      CORS_ORIGINS: http://localhost:8000
+      APP_URL: http://localhost:8000
+    ports:
+      - "8000:8000"
+
+volumes:
+  riskora_mongo:
