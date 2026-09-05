@@ -1,0 +1,46 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Push Riskora to GitHub",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"init; git remote remove origin 2>$null; git remote add origin https://github.com/feviStick/buildathon.git; git add .; git commit -m \"Build Riskora risk intelligence platform\"; git branch -M main; git push -u origin main"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Push Riskora to GitHub",
+			"type": "shell",
+			"command": "git init; git remote remove origin 2>$null; git remote add origin https://github.com/feviStick/buildathon.git; git add .; git commit -m \"Build Riskora risk intelligence platform\"; git branch -M main; git push -u origin main",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Push Riskora GitHub Clean",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"git init; git remote remove origin 2>$null; git remote add origin 'https://github.com/feviStick/buildathon.git'; git add .; git commit -m 'Build Riskora risk intelligence platform'; git branch -M main; git push -u origin main"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Commit and Push Riskora",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"git add .; git commit -m Riskora-build; git branch -M main; git push -u origin main"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
